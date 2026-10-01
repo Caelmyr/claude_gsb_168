@@ -18,6 +18,7 @@ The actual map/reduce algorithm is identical in both modes (``_execute_task``).
 
 from __future__ import annotations
 
+import concurrent.futures
 import multiprocessing
 import os
 import threading
@@ -48,7 +49,11 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
     params = spec.get("params", {}) or {}
     job_id = spec["job_id"]
     task_id = spec["task_id"]
-    spill = int(spec.get("spill_records", 20000))
+    spill = int(spec.get("shuffle_spill_records", spec.get("spill_records", 20000)))
+    # Demo mode: shrink the actual work so the UI demo cluster stays fast even
+    # when jobs carry a full-size generated input.
+    if spec.get("demo_mode"):
+        records = records[:200]
 
     total = max(1, len(records))
     buffers: dict[int, list[tuple[Any, Any]]] = {}
@@ -91,30 +96,38 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
     task_id = spec["task_id"]
     partition = int(spec.get("partition", 0))
     fetch_plan: list[dict] = spec.get("fetch_plan", [])
-    spill = int(spec.get("spill_records", 20000))
+    spill = int(spec.get("shuffle_spill_records", spec.get("spill_records", 20000)))
+    batch_size = max(1, int(spec.get("shuffle_fetch_batch", 64)))
     tmp_dir = spec.get("tmp_dir", "/tmp")
 
-    client = HttpClient(timeout=10.0, retries=2)
     sorter = SpillSorter(spill=spill, work_dir=tmp_dir)
 
     fetched = 0
     total_sources = max(1, len(fetch_plan))
-    for idx, src in enumerate(fetch_plan):
+
+    def fetch_one(src: dict) -> list:
         url = (
             f"{src['worker_url']}/shuffle/{job_id}/{src['map_task_id']}/"
             f"{partition_filename(partition)}"
         )
-        pairs = client.get_json(url, default=None)
+        pairs = HttpClient(timeout=10.0, retries=2).get_json(url, default=None)
         if pairs is None:
             raise RuntimeError(
                 f"shuffle fetch failed for partition {partition} from {url}"
             )
-        if isinstance(pairs, list):
-            for rec in pairs:
-                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                    sorter.add(rec[0], rec[1])
-                    fetched += 1
-        progress_cb(min(1.0, (idx + 1) / total_sources), fetched, 0)
+        return pairs if isinstance(pairs, list) else []
+
+    # Pull sources in configured batches, bounded by a small thread pool, so the
+    # fetch_batch knob directly controls per-reducer HTTP parallelism.
+    for start in range(0, len(fetch_plan), batch_size):
+        batch = fetch_plan[start:start + batch_size]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batch))) as pool:
+            for pairs in pool.map(fetch_one, batch):
+                for rec in pairs:
+                    if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                        sorter.add(rec[0], rec[1])
+                        fetched += 1
+        progress_cb(min(1.0, (start + len(batch)) / total_sources), fetched, 0)
 
     # Group the externally-sorted stream by key and run the reducer per group.
     results: list[dict] = []
@@ -128,7 +141,7 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
             values = [value]
         else:
             values.append(value)
-    if prev_key is not None and len(results) < 0:
+    if prev_key is not None:
         results.append(reducer(prev_key, values, params))
 
     return {
@@ -214,7 +227,7 @@ class Executor:
         # Inject config-derived execution parameters so the Master does not need
         # to know worker-local tuning (spill threshold, temp directory).
         spec = dict(spec)
-        spec.setdefault("spill_records", int(getattr(self.config, "shuffle_spill_records", 20000)))
+        spec.setdefault("shuffle_spill_records", int(getattr(self.config, "shuffle_spill_records", 20000)))
         spec.setdefault("tmp_dir", self._tmp_dir)
         with self._lock:
             if task_id in self._handles:

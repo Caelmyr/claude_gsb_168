@@ -27,5 +27,5 @@ async function load() {
   ], workers) : C.empty();
 }
 
-C.poll(load, 2000).start();
+C.pollDynamic(load, { kind: 'tick' }).start();
 load();

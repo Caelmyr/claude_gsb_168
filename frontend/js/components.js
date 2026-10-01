@@ -169,6 +169,67 @@ const Components = (() => {
     };
   }
 
+  // ------------------------------------------------------------------
+  // Cluster config shared by every page. Cached briefly so a page that both
+  // renders data and derives its refresh cadence does not spam /api/config;
+  // the config page busts the cache immediately after a save.
+  let _configCache = null;
+  let _configPromise = null;
+  function clusterConfig(force) {
+    if (!force && _configCache && Date.now() - _configCache.t < 5000) {
+      return Promise.resolve(_configCache.d);
+    }
+    if (!force && _configPromise) return _configPromise;
+    _configPromise = API.get('/api/config').then(d => {
+      _configCache = { d, t: Date.now() };
+      _configPromise = null;
+      return d;
+    }).catch(e => {
+      _configPromise = null;
+      throw e;
+    });
+    return _configPromise;
+  }
+
+  function _clampMs(sec, minMs = 500, maxMs = 60000) {
+    const ms = Math.round(Number(sec || 0) * 1000);
+    return Math.max(minMs, Math.min(maxMs, ms || minMs));
+  }
+
+  /**
+   * Poll whose cadence follows the live cluster config.
+   *   pollDynamic(fn, { kind: 'tick'|'metric', factor, minMs })
+   * The cadence is re-evaluated after every fetch, so a save on the config
+   * page changes this page's refresh rhythm within a few seconds (and
+   * immediately after a forced reload).
+   */
+  function pollDynamic(fn, opts) {
+    const kind = (opts && opts.kind) || 'tick';
+    const factor = (opts && opts.factor) || 1;
+    const minMs = (opts && opts.minMs) || 500;
+    let timer = null;
+    let stopped = false;
+    let cadence = _clampMs(kind === 'tick' ? 1 : 2, minMs) * factor;
+    async function run() {
+      if (stopped) return;
+      try {
+        await fn();
+      } catch (e) { /* transient */ }
+      if (stopped) return;
+      try {
+        const cfg = await clusterConfig();
+        const sec = kind === 'tick' ? cfg.scheduler_tick_sec : cfg.metric_interval_sec;
+        cadence = _clampMs(sec, minMs) * factor;
+      } catch (e) { /* keep previous cadence */ }
+      if (!stopped) timer = setTimeout(run, cadence);
+    }
+    return {
+      start() { run(); },
+      stop() { stopped = true; if (timer) clearTimeout(timer); },
+      cadenceMs() { return cadence; },
+    };
+  }
+
   function valueCell(rec) {
     // Render a result record generically: key -> value / values.
     const keys = Object.keys(rec).filter(k => k !== 'key');
@@ -194,6 +255,7 @@ const Components = (() => {
 
   return {
     PAGES, LABELS, CLASS, esc, fmtNum, fmtBytes, fmtTime, fmtDur, fmtPct,
-    stateBadge, progress, meter, empty, table, renderNav, init, toast, poll, valueCell, jobPicker,
+    stateBadge, progress, meter, empty, table, renderNav, init, toast,
+    poll, pollDynamic, clusterConfig, valueCell, jobPicker,
   };
 })();

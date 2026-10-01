@@ -16,6 +16,7 @@ never race.
 
 from __future__ import annotations
 
+import math
 import threading
 import traceback
 from typing import Optional
@@ -59,6 +60,9 @@ class Scheduler:
         self.logbus = logbus
         self.client = HttpClient(timeout=3.0, retries=1)
         self._stop = threading.Event()
+        # Woken on stop or on a config save so a changed ``scheduler_tick_sec``
+        # takes effect on the next beat instead of after the previous wait.
+        self._wake = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
 
     # ------------------------------------------------------------------
@@ -67,6 +71,11 @@ class Scheduler:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+    def notify_config_changed(self) -> None:
+        """Interrupt the current inter-tick wait so a new cadence applies at once."""
+        self._wake.set()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -74,7 +83,8 @@ class Scheduler:
                 self.tick()
             except Exception:  # noqa: BLE001 - a scheduler crash must not kill the Master
                 traceback.print_exc()
-            self._stop.wait(self.config.metric_interval_sec)
+            self._wake.wait(self.config.scheduler_tick_sec)
+            self._wake.clear()
 
     # ------------------------------------------------------------------
     def tick(self) -> None:
@@ -87,7 +97,10 @@ class Scheduler:
                     self.logbus.warn("", f"worker {worker.name} reaped; {count} tasks reassigned",
                                      task_id="cluster")
 
-        # 2. Advance each active job.
+        # 2. Kill tasks that have run past ``task_timeout_sec``.
+        self._enforce_task_timeouts()
+
+        # 3. Advance each active job.
         for job in self.job_manager.list_jobs():
             if job.is_terminal:
                 continue
@@ -95,6 +108,47 @@ class Scheduler:
                 self._advance(job)
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
+
+    # ------------------------------------------------------------------
+    def _enforce_task_timeouts(self) -> None:
+        timeout_ms = int(float(self.config.task_timeout_sec) * 1000)
+        now = now_ms()
+        for job in self.job_manager.list_jobs():
+            if job.is_terminal:
+                continue
+            for task in self.job_manager.tasks_for(job.job_id):
+                # RETRYING already has its own backoff/deadline bookkeeping;
+                # only actively-running work is subject to the timeout.
+                if task.status not in (C.TASK_ASSIGNED, C.TASK_RUNNING):
+                    continue
+                # ASSIGNED tasks have not reported RUNNING yet, so anchor on
+                # the dispatch timestamp when ``started_ms`` is still zero.
+                anchor = task.started_ms or task.assigned_ms
+                if anchor and (now - anchor) > timeout_ms:
+                    self.logbus.warn(
+                        job.job_id,
+                        f"task {task.task_id} exceeded task_timeout_sec="
+                        f"{self.config.task_timeout_sec}s; requeuing",
+                        task_id=task.task_id, worker_id=task.worker_id or "",
+                    )
+                    # Route through the same retry/fail path as an ordinary failure
+                    # so max_attempts and backoff are honoured consistently.
+                    self.fault_tolerance.handle_task_failure(
+                        job, task, f"timed out after {self.config.task_timeout_sec}s",
+                        task.worker_id or "",
+                    )
+                    if task.worker_id:
+                        self._cancel_remote(task.worker_id, task.task_id)
+
+    def _cancel_remote(self, worker_id: str, task_id: str) -> None:
+        worker = self.registry.get(worker_id)
+        if worker is None:
+            return
+        try:
+            self.client.post(f"{worker.address}/task/cancel",
+                             {"task_id": task_id}, timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     def _advance(self, job: Job) -> None:
@@ -136,13 +190,26 @@ class Scheduler:
         if not workers:
             return
 
+        # Cluster-wide in-flight cap for this stage: alive workers * factor.
+        # This is the knob the config page labels "Map/Reduce parallelism".
+        factor = (self.config.map_parallelism_factor if kind == C.TASK_MAP
+                  else self.config.reduce_parallelism_factor)
+        cap = max(1, math.ceil(len(self.registry.alive()) * float(factor)))
+        active = sum(
+            1 for t in self.job_manager.tasks_for(job.job_id, kind)
+            if t.status in C.TASK_ACTIVE_STATES
+        )
+
         for task in pending:
+            if active >= cap:
+                return
             if task.status == C.TASK_RETRYING and task.retry_after_ms > now_ms():
                 continue  # exponential backoff not yet elapsed
             worker = self._least_loaded(workers, exclude=None)
             if worker is None:
                 return
             self._dispatch(job, task, worker)
+            active += 1
 
     def _available_workers(self) -> list[WorkerRecord]:
         out: list[WorkerRecord] = []
@@ -219,6 +286,11 @@ class Scheduler:
             "params": job.params,
             "attempt": 0,
             "simulate_failure": bool(job.params.get("simulate_failure", False)),
+            # Live cluster config pushed with every dispatch, so a worker that
+            # booted before the last config save still executes with new values.
+            "shuffle_fetch_batch": int(self.config.shuffle_fetch_batch),
+            "shuffle_spill_records": int(self.config.shuffle_spill_records),
+            "demo_mode": bool(self.config.demo_mode),
         }
         if task.kind == C.TASK_MAP:
             spec["partition_count"] = job.num_reduce_tasks

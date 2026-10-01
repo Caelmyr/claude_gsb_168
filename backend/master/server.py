@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import threading
 from typing import Optional
 
 from flask import Flask, Response, jsonify, request, send_from_directory
@@ -45,6 +46,9 @@ class Master:
         self.config = (config or self.config_manager.load_cluster()).validated()
 
         self.logbus = LogBus(self.storage)
+        # Re-entrant: the PUT handler holds it while applying config, and the
+        # apply helper takes it too (also called standalone elsewhere).
+        self._config_lock = threading.RLock()
         self.job_manager = JobManager(self.storage, self.config, self.logbus)
         self.registry = WorkerRegistry(self.storage, self.config)
         self.metrics = Metrics(self.storage)
@@ -317,24 +321,42 @@ class Master:
     def _cluster_metrics(self):
         return jsonify(self.metrics.cluster_metrics(self.registry.all()))
 
+    def _apply_cluster_config(self, validated: ClusterConfig) -> None:
+        """Publish one validated config to the live object every module shares.
+
+        All Master-side collaborators (JobManager, planner, registry, scheduler,
+        fault tolerance) hold the same ``self.config`` reference, so an in-place
+        field copy makes a save take effect immediately everywhere.  The copy is
+        done under a lock and ends with ``notify_changed`` so the scheduler
+        wakes up right away instead of sleeping out the old tick.
+        """
+        with self._config_lock:
+            for name in ClusterConfig.__dataclass_fields__:
+                setattr(self.config, name, getattr(validated, name))
+
     def _config(self):
         if request.method == "PUT":
             body = request.get_json(silent=True) or {}
-            incoming = ClusterConfig.from_dict(body).validated()
-            # Mutate the shared config object in place so the scheduler (which
-            # holds the same reference) sees the new values immediately.
-            for field in ClusterConfig.__dataclass_fields__:
-                if field == "scheduler_tick_sec":
-                    continue
-                setattr(self.config, field, getattr(incoming, field))
-            self.config_manager.save_cluster(self.config)
+            with self._config_lock:
+                # Merge onto the *live* object (which is also the persisted
+                # source of truth in steady state) so fields the page does not
+                # render (e.g. ``seed``) are preserved; validate/clamp, persist,
+                # and publish the result to every live consumer in place.
+                validated = self.config.merged(body).validated()
+                self.config_manager.save_cluster(validated)
+                self._apply_cluster_config(validated)
+            # Wake the scheduler outside the config lock.
+            self.scheduler.notify_config_changed()
+            return jsonify(validated.to_dict())
+        with self._config_lock:
             return jsonify(self.config.to_dict())
-        return jsonify(self.config.to_dict())
 
     def _config_defaults(self):
         if request.method == "PUT":
             body = request.get_json(silent=True) or {}
-            defaults = self.config_manager.save_defaults(JobDefaults.from_dict(body))
+            # Partial merge: unrendered fields (e.g. ``params``) are preserved.
+            defaults = self.config_manager.save_defaults(
+                self.config_manager.load_defaults().merged(body))
             return jsonify(defaults.to_dict())
         return jsonify(self.config_manager.load_defaults().to_dict())
 
@@ -348,15 +370,21 @@ class Master:
         worker = self.registry.register(body)
         self.logbus.info("", f"worker {worker.name} registered ({worker.host}:{worker.port})",
                          task_id="cluster", worker_id=worker.worker_id)
-        return jsonify({"ok": True, "worker_id": worker.worker_id})
+        with self._config_lock:
+            return jsonify({"ok": True, "worker_id": worker.worker_id,
+                            "config": self.config.to_dict()})
 
     def _worker_heartbeat(self):
         body = request.get_json(silent=True) or {}
         worker = self.registry.heartbeat(body)
         if worker is None:
             return jsonify({"ok": False, "error": "unknown worker"}), 404
-        self.metrics.record_worker(worker)
-        return jsonify({"ok": True})
+        # ``metric_interval_sec`` gates how often heartbeats are recorded as
+        # metric samples; every heartbeat still proves liveness.
+        self.metrics.record_worker(
+            worker, min_interval_sec=float(self.config.metric_interval_sec))
+        with self._config_lock:
+            return jsonify({"ok": True, "config": self.config.to_dict()})
 
     def _worker_task_status(self):
         body = request.get_json(silent=True) or {}

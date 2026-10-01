@@ -18,6 +18,7 @@ const CLUSTER_FIELDS = [
   { key: 'metric_interval_sec', label: '指标采样周期 Metric interval (s)', type: 'number', step: 0.5, min: 0.5 },
   { key: 'demo_mode', label: '演示模式 Demo mode', type: 'checkbox' },
   { key: 'default_input_rows', label: '默认输入行数 Default input rows', type: 'number', step: 100, min: 10 },
+  { key: 'seed', label: '随机种子 Data seed', type: 'number', step: 1, min: 0 },
 ];
 
 const DEFAULT_FIELDS = [
@@ -64,15 +65,22 @@ async function load() {
 document.getElementById('save-cluster').addEventListener('click', async () => {
   const body = readForm('cluster-form', CLUSTER_FIELDS);
   try {
-    await API.put('/api/config', body);
-    C.toast('集群配置已保存 Cluster config saved', 'ok');
+    // The server returns the normalised (validated/clamped) values; re-render
+    // from that exact payload so the page never shows a value that is not the
+    // one now persisted and in effect.
+    const saved = await API.put('/api/config', body);
+    renderForm('cluster-form', CLUSTER_FIELDS, saved);
+    // Other pages derive refresh cadence from the cached config; drop it.
+    C.clusterConfig(true);
+    C.toast('集群配置已保存并即时生效 Cluster config saved and applied', 'ok');
   } catch (e) { C.toast('保存失败 ' + e.message, 'error'); }
 });
 
 document.getElementById('save-defaults').addEventListener('click', async () => {
   const body = readForm('defaults-form', DEFAULT_FIELDS);
   try {
-    await API.put('/api/config/defaults', body);
+    const saved = await API.put('/api/config/defaults', body);
+    renderForm('defaults-form', DEFAULT_FIELDS, saved);
     C.toast('默认值已保存 Defaults saved', 'ok');
   } catch (e) { C.toast('保存失败 ' + e.message, 'error'); }
 });

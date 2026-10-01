@@ -67,4 +67,5 @@ async function render() {
 C.jobPicker('job-picker', (id) => { currentJob = id; render(); });
 document.getElementById('refresh').addEventListener('click', render);
 setupFilters();
-C.poll(render, 2000).start();
+// Refresh cadence follows the scheduler tick configured on the config page.
+C.pollDynamic(render, { kind: 'tick' }).start();

@@ -38,4 +38,4 @@ async function render() {
 }
 
 C.jobPicker('job-picker', (id) => { currentJob = id; render(); });
-C.poll(render, 2000).start();
+C.pollDynamic(render, { kind: 'tick' }).start();

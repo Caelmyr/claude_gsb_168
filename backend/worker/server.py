@@ -60,7 +60,10 @@ class WorkerServer:
         )
         self.heartbeat = HeartbeatThread(
             self.worker_id, self.master_url,
-            self.config.heartbeat_timeout_sec, self._status_payload,
+            self.config.heartbeat_interval_sec, self._status_payload,
+            # Resolve the callback at call time so later replacements on this
+            # instance (e.g. tests) are seen by the already-running thread.
+            on_response=lambda payload: self._apply_master_payload(payload),
         )
         self.client = HttpClient(timeout=5.0, retries=1)
         self.registered = False
@@ -95,7 +98,33 @@ class WorkerServer:
         }
         resp = self.client.post(f"{self.master_url}/api/workers/register", payload, timeout=5.0)
         self.registered = resp.ok
+        if resp.ok:
+            self._apply_master_payload(resp.data if isinstance(resp.data, dict) else {})
         return self.registered
+
+    def _apply_master_payload(self, payload: dict) -> None:
+        """Adopt the Master's live cluster config (returned on register/heartbeat).
+
+        Workers run as separate processes and cannot share the Master's config
+        object, so the Master pushes its current config on every heartbeat
+        reply.  Mutating our config in place keeps the Executor (same
+        reference) in sync, and the heartbeat cadence is adjusted live.
+        """
+        cfg = (payload or {}).get("config")
+        if not isinstance(cfg, dict):
+            return
+        # The Master always echoes a complete config snapshot; require the
+        # signature field so a partial/garbled reply can never silently reset
+        # the worker back to dataclass defaults.
+        if "scheduler_tick_sec" not in cfg:
+            return
+        try:
+            validated = ClusterConfig.from_dict(cfg).validated()
+        except Exception:  # noqa: BLE001 - never let a bad reply kill the heartbeat
+            return
+        for name in ClusterConfig.__dataclass_fields__:
+            setattr(self.config, name, getattr(validated, name))
+        self.heartbeat.set_interval(self.config.heartbeat_interval_sec)
 
     def start(self) -> None:
         """Register with the Master (with retries) and start the heartbeat."""

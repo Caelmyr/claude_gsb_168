@@ -42,4 +42,4 @@ function debounce(fn, ms) {
   let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); };
 }
 
-C.poll(render, 3000).start();
+C.pollDynamic(render, { kind: 'metric', factor: 1.5 }).start();

@@ -24,11 +24,24 @@ def _mean(values: list[float]) -> float:
 class Metrics:
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
+        # worker_id -> ts_ms of the last *recorded* sample, used to honour the
+        # configured ``metric_interval_sec`` cadence regardless of heartbeat rate.
+        self._last_worker_sample: dict[str, int] = {}
 
     # -- recording ----------------------------------------------------
-    def record_worker(self, worker) -> None:
+    def record_worker(self, worker, min_interval_sec: float = 0.0) -> bool:
+        """Record a worker sample if the sampling interval has elapsed.
+
+        Returns True when a sample was appended, False when the heartbeat was
+        throttled by the configured metric cadence.
+        """
+        ts = now_ms()
+        last = self._last_worker_sample.get(worker.worker_id, 0)
+        if min_interval_sec and (ts - last) < int(float(min_interval_sec) * 1000):
+            return False
+        self._last_worker_sample[worker.worker_id] = ts
         sample = MetricSample(
-            ts_ms=now_ms(),
+            ts_ms=ts,
             worker_id=worker.worker_id,
             cpu_percent=worker.cpu_percent,
             mem_percent=worker.mem_percent,
@@ -37,6 +50,7 @@ class Metrics:
             tasks_completed=worker.total_tasks_completed,
         )
         self.storage.append(sample.to_dict(), "metrics", "workers", f"{worker.worker_id}.jsonl")
+        return True
 
     def record_task(self, job, task, duration_ms: float) -> None:
         # Throughput = records processed per second for this task.

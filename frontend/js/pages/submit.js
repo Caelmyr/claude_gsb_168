@@ -8,6 +8,14 @@ async function init() {
   const funcs = await API.get('/api/functions');
   SAMPLES = await API.get('/api/samples');
 
+  // Surface the cluster-wide default input rows (config page) as the field's
+  // placeholder; submitting an empty value makes the Master resolve it.
+  try {
+    const cfg = await API.get('/api/config');
+    const input = document.getElementById('input_rows');
+    input.placeholder = `默认 ${cfg.default_input_rows} (cluster default)`;
+  } catch (e) { /* config page optional */ }
+
   fillSelect('mapper', funcs.mappers);
   fillSelect('reducer', funcs.reducers);
 
@@ -52,9 +60,12 @@ async function onSubmit(ev) {
     reducer: document.getElementById('reducer').value,
     num_map_tasks: parseInt(document.getElementById('num_map_tasks').value, 10),
     num_reduce_tasks: parseInt(document.getElementById('num_reduce_tasks').value, 10),
-    input_rows: parseInt(document.getElementById('input_rows').value, 10),
     params: {},
   };
+  // An empty rows field is omitted so the Master falls back to the cluster
+  // default configured on the config page.
+  const rows = parseInt(document.getElementById('input_rows').value, 10);
+  if (!isNaN(rows)) body.input_rows = rows;
   if (document.getElementById('simulate_failure').checked) body.params.simulate_failure = true;
   const btn = ev.target.querySelector('button[type=submit]');
   btn.disabled = true;
@@ -84,4 +95,4 @@ async function loadRecent() {
 }
 
 init();
-C.poll(loadRecent, 4000).start();
+C.pollDynamic(loadRecent, { kind: 'metric', factor: 2 }).start();

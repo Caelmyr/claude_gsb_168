@@ -50,5 +50,5 @@ function stageBars(job) {
   return `<div style="min-width:180px">${parts.join('')}</div>`;
 }
 
-C.poll(load, 2500).start();
+C.pollDynamic(load, { kind: 'tick' }).start();
 load();

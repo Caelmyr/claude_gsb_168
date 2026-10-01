@@ -75,6 +75,9 @@ def _wait_for(client: HttpClient, url: str, timeout: float) -> bool:
 def _submit_demo_job(client: HttpClient, master_url: str, fault: bool) -> dict:
     from backend.tasks.samples import SAMPLE_JOBS
     spec = dict(SAMPLE_JOBS[0])
+    # Omit the preset's row count so the cluster config's default_input_rows
+    # (editable on the config page) actually drives the demo job size.
+    spec.pop("input_rows", None)
     if fault:
         spec["params"] = {"simulate_failure": True}
         spec["name"] = spec["name"] + " (fault injection)"

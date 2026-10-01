@@ -2,9 +2,15 @@
 
 Config is stored as JSON under ``data/config/`` and edited through the frontend
 config page.  The Master reads ``ClusterConfig`` for all timing/scheduling
-decisions; ``JobDefaults`` seeds the submit page so a user can launch a job with
-one click.  Validation clamps values into sane ranges so a bad manual edit can
-never wedge the scheduler.
+decisions, and echoes a full snapshot to every Worker on register/heartbeat
+replies so separate worker processes run with the same live values.  A PUT from
+the config page is a *partial merge* onto the live object, validated/clamped,
+persisted, and applied in place; every Master-side collaborator holds the same
+config reference and the scheduler wakes immediately, so the value displayed,
+the value on disk and the value actually in use never diverge.  ``JobDefaults``
+seeds the submit page so a user can launch a job with one click.  Validation
+clamps values into sane ranges so a bad manual edit can never wedge the
+scheduler.
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ class ClusterConfig:
     """Tunable cluster-wide parameters (Master-side)."""
 
     heartbeat_interval_sec: float = 2.0          # worker -> master cadence
-    heartbeat_timeout_sec: float = 80.0          # mark worker dead after this silence
+    heartbeat_timeout_sec: float = 8.0           # mark worker dead after this silence
     task_timeout_sec: float = 300.0              # kill a task stuck longer than this
     max_attempts: int = 3                        # per-task retry budget
     retry_backoff_base_sec: float = 1.0          # exponential backoff base
@@ -54,8 +60,8 @@ class ClusterConfig:
     shuffle_spill_records: int = 20000           # external-sort spill threshold
     map_parallelism_factor: float = 3.0          # map tasks ~ workers * factor
     reduce_parallelism_factor: float = 2.0
-    scheduler_tick_sec: float = 5.0              # master scheduling loop cadence
-    metric_interval_sec: float = 2.0             # metric sample cadence
+    scheduler_tick_sec: float = 1.0              # master scheduling loop cadence
+    metric_interval_sec: float = 2.0             # metric sample / UI refresh cadence
     demo_mode: bool = False                      # simulate work for fast UI demos
     default_input_rows: int = 12000              # generated input size for sample jobs
     seed: int = 20260930
@@ -67,6 +73,17 @@ class ClusterConfig:
     def from_dict(cls, d: dict) -> "ClusterConfig":
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
+
+    def merged(self, d: dict) -> "ClusterConfig":
+        """Return a copy patched with the recognised keys from ``d``.
+
+        Fields absent from (or unparseable in) ``d`` keep their current value,
+        so a partial form submit (e.g. one edited field) can never silently
+        reset the others.
+        """
+        known = {f.name for f in type(self).__dataclass_fields__.values()}
+        patch = {k: v for k, v in (d or {}).items() if k in known}
+        return ClusterConfig.from_dict({**self.to_dict(), **patch})
 
     def validated(self) -> "ClusterConfig":
         """Return a copy with every field clamped into a safe range."""
@@ -109,6 +126,12 @@ class JobDefaults:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
+    def merged(self, d: dict) -> "JobDefaults":
+        """Partial-update copy; fields absent from ``d`` (incl. ``params``) stay."""
+        known = {f.name for f in JobDefaults.__dataclass_fields__.values()}
+        patch = {k: v for k, v in (d or {}).items() if k in known}
+        return JobDefaults.from_dict({**self.to_dict(), **patch})
+
     def validated(self) -> "JobDefaults":
         return JobDefaults(
             mapper=str(self.mapper or "wordcount_mapper"),
@@ -129,22 +152,29 @@ class ConfigManager:
     # -- cluster ------------------------------------------------------
     def load_cluster(self) -> ClusterConfig:
         doc = self.storage.read("config", "cluster.json", default={})
-        return ClusterConfig.from_dict(doc) if doc else ClusterConfig()
+        return ClusterConfig.from_dict(doc).validated() if doc else ClusterConfig()
 
     def save_cluster(self, cfg: ClusterConfig) -> ClusterConfig:
         validated = cfg.validated()
         self.storage.write(validated.to_dict(), "config", "cluster.json")
         return validated
 
+    def update_cluster(self, patch: dict) -> ClusterConfig:
+        """Merge a partial patch onto the persisted config, then persist it."""
+        return self.save_cluster(self.load_cluster().merged(patch))
+
     # -- job defaults -------------------------------------------------
     def load_defaults(self) -> JobDefaults:
         doc = self.storage.read("config", "job_defaults.json", default={})
-        return JobDefaults.from_dict(doc) if doc else JobDefaults()
+        return JobDefaults.from_dict(doc).validated() if doc else JobDefaults()
 
     def save_defaults(self, defaults: JobDefaults) -> JobDefaults:
         validated = defaults.validated()
         self.storage.write(validated.to_dict(), "config", "job_defaults.json")
         return validated
+
+    def update_defaults(self, patch: dict) -> JobDefaults:
+        return self.save_defaults(self.load_defaults().merged(patch))
 
     # -- combined -----------------------------------------------------
     def all(self) -> dict:

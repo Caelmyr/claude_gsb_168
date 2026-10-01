@@ -69,4 +69,4 @@ window.addEventListener('themechange', () => { loadJobMetrics(); loadCluster(); 
 
 C.jobPicker('job-picker', (id) => { currentJob = id; loadJobMetrics(); });
 loadCluster();
-C.poll(() => { loadJobMetrics(); loadCluster(); }, 3000).start();
+C.pollDynamic(() => { loadJobMetrics(); loadCluster(); }, { kind: 'metric' }).start();

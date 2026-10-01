@@ -81,7 +81,12 @@ class JobManager:
         defaults = payload.get("_defaults") or {}
         num_map = int(payload.get("num_map_tasks", defaults.get("num_map_tasks", 8)))
         num_reduce = int(payload.get("num_reduce_tasks", defaults.get("num_reduce_tasks", 4)))
-        input_rows = int(payload.get("input_rows", defaults.get("input_rows", 12000)))
+        # Resolution order: explicit submit value -> saved job defaults ->
+        # cluster-wide ``default_input_rows``.
+        input_rows = int(payload.get(
+            "input_rows",
+            defaults.get("input_rows", int(self.config.default_input_rows)),
+        ))
         params = dict(payload.get("params") or {})
         params["input_kind"] = input_kind_for(mapper)
 
