@@ -27,13 +27,23 @@ class HeartbeatThread(threading.Thread):
         super().__init__(daemon=True, name=f"heartbeat-{worker_id}")
         self.worker_id = worker_id
         self.master_url = master_url.rstrip("/")
-        self.interval = max(0.2, interval_sec / 4.0)
+        self.interval = max(0.2, float(interval_sec))
         self.status_provider = status_provider
         self.client = client or HttpClient(timeout=5.0, retries=1)
         # NOTE: named ``_stop_event`` (not ``_stop``) because ``threading._after_fork``
         # calls the ``Thread._stop()`` method during fork; shadowing it with an Event
         # would raise inside the forked child.
         self._stop_event = threading.Event()
+        self._condition = threading.Condition()
+        self._wake_generation = 0
+
+    def set_interval(self, interval_sec: float) -> None:
+        new_interval = max(0.2, float(interval_sec))
+        with self._condition:
+            if new_interval != self.interval:
+                self.interval = new_interval
+                self._wake_generation += 1
+                self._condition.notify_all()
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -45,7 +55,15 @@ class HeartbeatThread(threading.Thread):
                 # A dropped heartbeat is expected during a Master restart; the
                 # next tick retries and the Master's own timeout is generous.
                 pass
-            self._stop_event.wait(self.interval)
+            with self._condition:
+                interval = self.interval
+                generation = self._wake_generation
+                while (not self._stop_event.is_set()
+                       and generation == self._wake_generation):
+                    if not self._condition.wait(timeout=interval):
+                        break
 
     def stop(self) -> None:
         self._stop_event.set()
+        with self._condition:
+            self._condition.notify_all()

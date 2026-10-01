@@ -1,6 +1,7 @@
 /* 节点管理 Nodes */
 Components.init('nodes');
 const C = Components;
+RuntimeConfig.start();
 
 async function load() {
   let d;
@@ -18,7 +19,11 @@ async function load() {
     { key: 'name', label: '节点 Worker', render: r => `<b>${C.esc(r.name)}</b><div class="small muted mono">${C.esc(r.worker_id)}</div>` },
     { key: 'address', label: '地址 Address', render: r => `<span class="mono">${C.esc(r.host)}:${r.port}</span>` },
     { key: 'status', label: '状态 Status', render: r => C.stateBadge(r.status, true) },
-    { key: 'heartbeat', label: '最后心跳 Heartbeat', render: r => `<span class="small">${C.fmtTime(r.last_heartbeat_ms)}</span><div class="small muted">${(Date.now()-r.last_heartbeat_ms)/1000 < 8 ? '刚刚 now' : '超时 stale'}</div>` },
+    { key: 'heartbeat', label: '最后心跳 Heartbeat', render: r => {
+      const staleAfter = RuntimeConfig.get().heartbeat_timeout_sec * 1000;
+      const fresh = Date.now() - r.last_heartbeat_ms < staleAfter;
+      return `<span class="small">${C.fmtTime(r.last_heartbeat_ms)}</span><div class="small muted">${fresh ? '刚刚 now' : '超时 stale'}</div>`;
+    } },
     { key: 'cpu', label: 'CPU', render: r => C.meter(r.cpu_percent) },
     { key: 'mem', label: '内存 Mem', render: r => C.meter(r.mem_percent) },
     { key: 'load1', label: '负载 load', render: r => C.fmtNum(Number(r.load1).toFixed(2)), num: true },
@@ -27,5 +32,5 @@ async function load() {
   ], workers) : C.empty();
 }
 
-C.poll(load, 2000).start();
+C.configPoll(load, 'scheduler_tick_sec').start();
 load();

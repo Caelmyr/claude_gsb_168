@@ -15,6 +15,7 @@ running so the Master can track liveness and load.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Optional
 
@@ -49,7 +50,11 @@ class WorkerServer:
         self.worker_id = worker_id or new_id("worker")
         self.name = name or f"worker-{port}"
         self.master_url = master_url.rstrip("/")
-        self.config = config or ClusterConfig()
+        self.config = (config or ClusterConfig()).validated()
+        self._local_config_overrides = {
+            name: getattr(self.config, name) for name in ClusterConfig.__dataclass_fields__
+            if getattr(ClusterConfig(), name) != getattr(self.config, name)
+        }
         self.exec_mode = exec_mode
 
         self.storage = Storage(data_root)
@@ -60,10 +65,11 @@ class WorkerServer:
         )
         self.heartbeat = HeartbeatThread(
             self.worker_id, self.master_url,
-            self.config.heartbeat_timeout_sec, self._status_payload,
+            self.config.heartbeat_interval_sec, self._status_payload,
         )
         self.client = HttpClient(timeout=5.0, retries=1)
         self.registered = False
+        self._config_stop = threading.Event()
 
         self.app = Flask(f"worker-{port}")
         self._register_routes()
@@ -83,6 +89,26 @@ class WorkerServer:
             "queued_tasks": 0,
         }
 
+    def _apply_config(self, config: ClusterConfig) -> None:
+        merged = config.merge(self._local_config_overrides)
+        self.config = merged.validated()
+        self.executor.config = self.config
+        self.heartbeat.set_interval(self.config.heartbeat_interval_sec)
+
+    def _refresh_config(self) -> bool:
+        try:
+            resp = self.client.get(f"{self.master_url}/api/config", timeout=3.0)
+        except Exception:
+            return False
+        if not resp.ok or not isinstance(resp.data, dict):
+            return False
+        self._apply_config(ClusterConfig.from_dict(resp.data))
+        return True
+
+    def _config_loop(self) -> None:
+        while not self._config_stop.wait(1.0):
+            self._refresh_config()
+
     def register(self) -> bool:
         payload = {
             "worker_id": self.worker_id,
@@ -95,6 +121,8 @@ class WorkerServer:
         }
         resp = self.client.post(f"{self.master_url}/api/workers/register", payload, timeout=5.0)
         self.registered = resp.ok
+        if self.registered:
+            self._refresh_config()
         return self.registered
 
     def start(self) -> None:
@@ -103,6 +131,8 @@ class WorkerServer:
             if self.register():
                 break
             time.sleep(1.0)
+        threading.Thread(target=self._config_loop, daemon=True,
+                         name=f"config-refresh-{self.worker_id}").start()
         self.heartbeat.start()
 
     def serve(self) -> None:

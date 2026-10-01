@@ -1,15 +1,23 @@
 /* 作业提交 Submit */
 Components.init('submit');
 const C = Components;
+RuntimeConfig.start();
 
 let SAMPLES = [];
 
 async function init() {
   const funcs = await API.get('/api/functions');
   SAMPLES = await API.get('/api/samples');
+  const defaults = await API.get('/api/config/defaults');
 
   fillSelect('mapper', funcs.mappers);
   fillSelect('reducer', funcs.reducers);
+
+  document.getElementById('mapper').value = defaults.mapper;
+  document.getElementById('reducer').value = defaults.reducer;
+  document.getElementById('num_map_tasks').value = defaults.num_map_tasks;
+  document.getElementById('num_reduce_tasks').value = defaults.num_reduce_tasks;
+  document.getElementById('input_rows').value = defaults.input_rows;
 
   const preset = document.getElementById('preset');
   preset.innerHTML = SAMPLES.map(s => `<option value="${s.name}">${C.esc(s.name)}</option>`).join('');
@@ -84,4 +92,4 @@ async function loadRecent() {
 }
 
 init();
-C.poll(loadRecent, 4000).start();
+C.configPoll(loadRecent, 'metric_interval_sec').start();

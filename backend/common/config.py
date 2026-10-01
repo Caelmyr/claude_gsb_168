@@ -68,11 +68,18 @@ class ClusterConfig:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
+    def merge(self, values: dict) -> "ClusterConfig":
+        """Return a copy containing only fields explicitly present in ``values``."""
+        current = self.to_dict()
+        known = {f.name for f in type(self).__dataclass_fields__.values()}
+        current.update({k: v for k, v in (values or {}).items() if k in known})
+        return ClusterConfig.from_dict(current)
+
     def validated(self) -> "ClusterConfig":
         """Return a copy with every field clamped into a safe range."""
         return ClusterConfig(
             heartbeat_interval_sec=_num(self.heartbeat_interval_sec, 2.0, 0.2, 60.0),
-            heartbeat_timeout_sec=_num(self.heartbeat_timeout_sec, 8.0, 1.0, 300.0),
+            heartbeat_timeout_sec=_num(self.heartbeat_timeout_sec, 80.0, 1.0, 300.0),
             task_timeout_sec=_num(self.task_timeout_sec, 300.0, 5.0, 3600.0),
             max_attempts=_int(self.max_attempts, 3, 1, 10),
             retry_backoff_base_sec=_num(self.retry_backoff_base_sec, 1.0, 0.1, 60.0),
@@ -95,7 +102,7 @@ class JobDefaults:
     """Default job parameters shown on the submit page."""
 
     mapper: str = "wordcount_mapper"
-    reducer: str = "wordcount_reducer"
+    reducer: str = "count_reducer"
     num_map_tasks: int = 8
     num_reduce_tasks: int = 4
     input_rows: int = 12000
@@ -109,10 +116,16 @@ class JobDefaults:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
+    def merge(self, values: dict) -> "JobDefaults":
+        current = self.to_dict()
+        known = {f.name for f in type(self).__dataclass_fields__.values()}
+        current.update({k: v for k, v in (values or {}).items() if k in known})
+        return JobDefaults.from_dict(current)
+
     def validated(self) -> "JobDefaults":
         return JobDefaults(
             mapper=str(self.mapper or "wordcount_mapper"),
-            reducer=str(self.reducer or "wordcount_reducer"),
+            reducer=str(self.reducer or "count_reducer"),
             num_map_tasks=_int(self.num_map_tasks, 8, 1, 1000),
             num_reduce_tasks=_int(self.num_reduce_tasks, 4, 1, 500),
             input_rows=_int(self.input_rows, 12000, 10, 10_000_000),
@@ -136,6 +149,15 @@ class ConfigManager:
         self.storage.write(validated.to_dict(), "config", "cluster.json")
         return validated
 
+    def update_cluster(self, values: dict) -> ClusterConfig:
+        """Validate and persist a partial update without wiping omitted fields."""
+        validated = self.save_cluster(self.load_cluster().merge(values))
+        if "default_input_rows" in values:
+            self.save_defaults(self.load_defaults().merge({
+                "input_rows": validated.default_input_rows
+            }))
+        return validated
+
     # -- job defaults -------------------------------------------------
     def load_defaults(self) -> JobDefaults:
         doc = self.storage.read("config", "job_defaults.json", default={})
@@ -144,6 +166,14 @@ class ConfigManager:
     def save_defaults(self, defaults: JobDefaults) -> JobDefaults:
         validated = defaults.validated()
         self.storage.write(validated.to_dict(), "config", "job_defaults.json")
+        return validated
+
+    def update_defaults(self, values: dict, sync_input_rows: bool = False) -> JobDefaults:
+        validated = self.save_defaults(self.load_defaults().merge(values))
+        if sync_input_rows and "input_rows" in values:
+            self.save_cluster(self.load_cluster().merge({
+                "default_input_rows": validated.input_rows
+            }))
         return validated
 
     # -- combined -----------------------------------------------------
@@ -159,3 +189,8 @@ class ConfigManager:
             self.save_cluster(ClusterConfig())
         if self.storage.read("config", "job_defaults.json") is None:
             self.save_defaults(JobDefaults())
+        else:
+            defaults = self.load_defaults()
+            if defaults.reducer == "wordcount_reducer":
+                defaults.reducer = "count_reducer"
+                self.save_defaults(defaults)

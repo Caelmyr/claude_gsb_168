@@ -67,6 +67,7 @@ async function loadResource(workerId) {
 document.getElementById('worker-sel').addEventListener('change', e => loadResource(e.target.value));
 window.addEventListener('themechange', () => { loadJobMetrics(); loadCluster(); });
 
+RuntimeConfig.start();
 C.jobPicker('job-picker', (id) => { currentJob = id; loadJobMetrics(); });
 loadCluster();
-C.poll(() => { loadJobMetrics(); loadCluster(); }, 3000).start();
+C.configPoll(() => { loadJobMetrics(); loadCluster(); }, 'metric_interval_sec').start();

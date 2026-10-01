@@ -1,6 +1,7 @@
 /* 结果导出 Results */
 Components.init('results');
 const C = Components;
+RuntimeConfig.start();
 
 let currentJob = '';
 
@@ -37,4 +38,4 @@ async function render() {
 }
 
 C.jobPicker('job-picker', (id) => { currentJob = id; render(); });
-C.poll(render, 3000).start();
+C.configPoll(render, 'scheduler_tick_sec').start();

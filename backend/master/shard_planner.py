@@ -48,6 +48,9 @@ class ShardPlanner:
         """Generate input records, split them into shards, and build tasks."""
         kind = job.params.get("input_kind", "wordcount")
         rows = max(1, int(job.input_rows))
+        if bool(getattr(self.config, "demo_mode", False)):
+            rows = min(rows, 1000)
+            job.input_rows = rows
         records = generate_input_records(kind, rows, self._seed_for(job))
 
         # Granularity: never create more map tasks than there are input records.

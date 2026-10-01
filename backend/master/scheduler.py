@@ -59,6 +59,8 @@ class Scheduler:
         self.logbus = logbus
         self.client = HttpClient(timeout=3.0, retries=1)
         self._stop = threading.Event()
+        self._condition = threading.Condition()
+        self._wake_generation = 0
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
 
     # ------------------------------------------------------------------
@@ -67,6 +69,14 @@ class Scheduler:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+
+    def wake(self) -> None:
+        """Interrupt the current wait so a configuration change applies at once."""
+        with self._condition:
+            self._wake_generation += 1
+            self._condition.notify_all()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -74,10 +84,18 @@ class Scheduler:
                 self.tick()
             except Exception:  # noqa: BLE001 - a scheduler crash must not kill the Master
                 traceback.print_exc()
-            self._stop.wait(self.config.metric_interval_sec)
+            interval = max(0.05, float(self.config.scheduler_tick_sec))
+            with self._condition:
+                generation = self._wake_generation
+                while (not self._stop.is_set()
+                       and generation == self._wake_generation):
+                    if not self._condition.wait(timeout=interval):
+                        break
 
     # ------------------------------------------------------------------
     def tick(self) -> None:
+        self._enforce_task_timeouts()
+
         # 1. Reap dead workers and reassign their tasks (on a coarser cadence).
         self._tick_count = getattr(self, "_tick_count", 0) + 1
         if self._tick_count % 5 == 0:
@@ -95,6 +113,30 @@ class Scheduler:
                 self._advance(job)
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
+
+    def _enforce_task_timeouts(self) -> None:
+        timeout_ms = int(float(self.config.task_timeout_sec) * 1000)
+        now = now_ms()
+        for job in self.job_manager.list_jobs():
+            if job.is_terminal:
+                continue
+            for task in self.job_manager.tasks_for(job.job_id):
+                if task.status not in (C.TASK_ASSIGNED, C.TASK_RUNNING):
+                    continue
+                since = task.started_ms or task.assigned_ms
+                if since and now - since > timeout_ms:
+                    worker_id = task.worker_id or ""
+                    if worker_id:
+                        worker = self.registry.get(worker_id)
+                        if worker is not None:
+                            try:
+                                self.client.post(f"{worker.address}/task/cancel",
+                                                 {"task_id": task.task_id}, timeout=2.0)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    self.fault_tolerance.handle_task_failure(
+                        job, task, f"timed out after {self.config.task_timeout_sec}s", worker_id,
+                    )
 
     # ------------------------------------------------------------------
     def _advance(self, job: Job) -> None:
@@ -227,6 +269,8 @@ class Scheduler:
             spec["partition"] = task.partition
             spec["fetch_plan"] = (task.stats or {}).get("fetch_plan", [])
             spec["num_map_tasks"] = job.num_map_tasks
+        spec["shuffle_spill_records"] = int(self.config.shuffle_spill_records)
+        spec["shuffle_fetch_batch"] = int(self.config.shuffle_fetch_batch)
         return spec
 
     # ------------------------------------------------------------------

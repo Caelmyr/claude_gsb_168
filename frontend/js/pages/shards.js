@@ -1,6 +1,7 @@
 /* 分片管理 Shards */
 Components.init('shards');
 const C = Components;
+RuntimeConfig.start();
 
 let currentJob = '';
 
@@ -38,4 +39,4 @@ async function render() {
 }
 
 C.jobPicker('job-picker', (id) => { currentJob = id; render(); });
-C.poll(render, 2000).start();
+C.configPoll(render, 'scheduler_tick_sec').start();

@@ -158,16 +158,30 @@ const Components = (() => {
   function poll(fn, ms) {
     let timer = null;
     let stopped = false;
+    let delay = ms;
     async function run() {
       if (stopped) return;
       try { await fn(); } catch (e) { /* transient */ }
-      if (!stopped) timer = setTimeout(run, ms);
+      if (!stopped) timer = setTimeout(run, delay);
     }
     return {
       start() { run(); },
       stop() { stopped = true; if (timer) clearTimeout(timer); },
+      setInterval(value) {
+        const next = Math.max(50, Number(value) || ms);
+        if (Math.abs(next - delay) < 0.001) return;
+        delay = next;
+        if (!stopped && timer) { clearTimeout(timer); timer = null; run(); }
+      },
     };
   }
+
+  function configPoll(fn, key) {
+    const poller = poll(fn, RuntimeConfig.get()[key] * 1000);
+    RuntimeConfig.onChange(cfg => poller.setInterval(cfg[key] * 1000));
+    return poller;
+  }
+  RuntimeConfig.start();
 
   function valueCell(rec) {
     // Render a result record generically: key -> value / values.
@@ -194,6 +208,7 @@ const Components = (() => {
 
   return {
     PAGES, LABELS, CLASS, esc, fmtNum, fmtBytes, fmtTime, fmtDur, fmtPct,
-    stateBadge, progress, meter, empty, table, renderNav, init, toast, poll, valueCell, jobPicker,
+    stateBadge, progress, meter, empty, table, renderNav, init, toast, poll, configPoll,
+    valueCell, jobPicker,
   };
 })();

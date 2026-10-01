@@ -2,22 +2,24 @@
 Components.init('config');
 const C = Components;
 
+const numberField = (key, label, opts) => ({ key, label, type: 'number', min: opts.min, max: opts.max, step: opts.step });
+
 const CLUSTER_FIELDS = [
-  { key: 'heartbeat_interval_sec', label: '心跳间隔 Heartbeat interval (s)', type: 'number', step: 0.5, min: 0.2 },
-  { key: 'heartbeat_timeout_sec', label: '心跳超时 Heartbeat timeout (s)', type: 'number', step: 0.5, min: 1 },
-  { key: 'task_timeout_sec', label: '任务超时 Task timeout (s)', type: 'number', step: 5, min: 5 },
-  { key: 'max_attempts', label: '最大重试次数 Max attempts', type: 'number', step: 1, min: 1 },
-  { key: 'retry_backoff_base_sec', label: '重试退避基数 Backoff base (s)', type: 'number', step: 0.1, min: 0.1 },
+  numberField('heartbeat_interval_sec', '心跳间隔 Heartbeat interval (s)', { step: 0.5, min: 0.2, max: 60 }),
+  numberField('heartbeat_timeout_sec', '心跳超时 Heartbeat timeout (s)', { step: 0.5, min: 1, max: 300 }),
+  numberField('task_timeout_sec', '任务超时 Task timeout (s)', { step: 5, min: 5, max: 3600 }),
+  numberField('max_attempts', '最大重试次数 Max attempts', { step: 1, min: 1, max: 10 }),
+  numberField('retry_backoff_base_sec', '重试退避基数 Backoff base (s)', { step: 0.1, min: 0.1, max: 60 }),
   { key: 'speculative_execution', label: '推测执行 Speculative execution', type: 'checkbox' },
-  { key: 'speculation_threshold', label: '推测阈值 Speculation threshold (×median)', type: 'number', step: 0.1, min: 1 },
-  { key: 'shuffle_fetch_batch', label: 'Shuffle 拉取批次 Fetch batch', type: 'number', step: 1, min: 1 },
-  { key: 'shuffle_spill_records', label: 'Shuffle 溢写阈值 Spill records', type: 'number', step: 100, min: 100 },
-  { key: 'map_parallelism_factor', label: 'Map 并行因子 Map parallelism', type: 'number', step: 0.5, min: 0.5 },
-  { key: 'reduce_parallelism_factor', label: 'Reduce 并行因子 Reduce parallelism', type: 'number', step: 0.5, min: 0.5 },
-  { key: 'scheduler_tick_sec', label: '调度周期 Scheduler tick (s)', type: 'number', step: 0.05, min: 0.05 },
-  { key: 'metric_interval_sec', label: '指标采样周期 Metric interval (s)', type: 'number', step: 0.5, min: 0.5 },
+  numberField('speculation_threshold', '推测阈值 Speculation threshold (×median)', { step: 0.1, min: 1, max: 10 }),
+  numberField('shuffle_fetch_batch', 'Shuffle 拉取批次 Fetch batch', { step: 1, min: 1, max: 10000 }),
+  numberField('shuffle_spill_records', 'Shuffle 溢写阈值 Spill records', { step: 100, min: 100, max: 1000000 }),
+  numberField('map_parallelism_factor', 'Map 并行因子 Map parallelism', { step: 0.5, min: 0.5, max: 50 }),
+  numberField('reduce_parallelism_factor', 'Reduce 并行因子 Reduce parallelism', { step: 0.5, min: 0.5, max: 50 }),
+  numberField('scheduler_tick_sec', '调度周期 Scheduler tick (s)', { step: 0.05, min: 0.05, max: 10 }),
+  numberField('metric_interval_sec', '指标采样周期 Metric interval (s)', { step: 0.5, min: 0.5, max: 60 }),
   { key: 'demo_mode', label: '演示模式 Demo mode', type: 'checkbox' },
-  { key: 'default_input_rows', label: '默认输入行数 Default input rows', type: 'number', step: 100, min: 10 },
+  numberField('seed', '随机种子 Seed', { step: 1, min: 0, max: 2147483647 }),
 ];
 
 const DEFAULT_FIELDS = [
@@ -25,7 +27,7 @@ const DEFAULT_FIELDS = [
   { key: 'reducer', label: '默认 Reduce 函数 Default reducer', type: 'text' },
   { key: 'num_map_tasks', label: '默认 Map 任务数 Map tasks', type: 'number', step: 1, min: 1 },
   { key: 'num_reduce_tasks', label: '默认 Reduce 任务数 Reduce tasks', type: 'number', step: 1, min: 1 },
-  { key: 'input_rows', label: '默认输入行数 Input rows', type: 'number', step: 100, min: 10 },
+  { key: 'input_rows', label: '默认输入行数 Default input rows（新作业/sample jobs）', type: 'number', step: 100, min: 10 },
 ];
 
 function renderForm(hostId, fields, data) {
@@ -39,7 +41,8 @@ function renderForm(hostId, fields, data) {
     }
     return `<label>${C.esc(f.label)}</label>
       <input type="${f.type}" id="${hostId}-${f.key}" value="${C.esc(data[f.key])}"
-        ${f.step ? `step="${f.step}"` : ''} ${f.min != null ? `min="${f.min}"` : ''}>`;
+        ${f.step ? `step="${f.step}"` : ''} ${f.min != null ? `min="${f.min}"` : ''}
+        ${f.max != null ? `max="${f.max}"` : ''}>`;
   }).join('');
 }
 
@@ -55,6 +58,7 @@ function readForm(hostId, fields) {
 }
 
 async function load() {
+  RuntimeConfig.start();
   const cfg = await API.get('/api/config');
   renderForm('cluster-form', CLUSTER_FIELDS, cfg);
   const defaults = await API.get('/api/config/defaults');
@@ -64,15 +68,19 @@ async function load() {
 document.getElementById('save-cluster').addEventListener('click', async () => {
   const body = readForm('cluster-form', CLUSTER_FIELDS);
   try {
-    await API.put('/api/config', body);
-    C.toast('集群配置已保存 Cluster config saved', 'ok');
+    const saved = await RuntimeConfig.save(body);
+    renderForm('cluster-form', CLUSTER_FIELDS, saved);
+    C.toast('集群配置已保存并生效 Cluster config saved and applied', 'ok');
   } catch (e) { C.toast('保存失败 ' + e.message, 'error'); }
 });
 
 document.getElementById('save-defaults').addEventListener('click', async () => {
   const body = readForm('defaults-form', DEFAULT_FIELDS);
   try {
-    await API.put('/api/config/defaults', body);
+    const saved = await API.put('/api/config/defaults', body);
+    renderForm('defaults-form', DEFAULT_FIELDS, saved);
+    const cfg = await RuntimeConfig.refresh(true);
+    renderForm('cluster-form', CLUSTER_FIELDS, cfg);
     C.toast('默认值已保存 Defaults saved', 'ok');
   } catch (e) { C.toast('保存失败 ' + e.message, 'error'); }
 });

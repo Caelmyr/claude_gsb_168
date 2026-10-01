@@ -1,6 +1,7 @@
 /* 总览 Overview */
 Components.init('home');
 const C = Components;
+RuntimeConfig.start();
 
 async function load() {
   let ov;
@@ -50,5 +51,5 @@ function stageBars(job) {
   return `<div style="min-width:180px">${parts.join('')}</div>`;
 }
 
-C.poll(load, 2500).start();
+C.configPoll(load, 'scheduler_tick_sec').start();
 load();

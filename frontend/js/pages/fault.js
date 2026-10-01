@@ -1,6 +1,7 @@
 /* 故障恢复 Fault */
 Components.init('fault');
 const C = Components;
+RuntimeConfig.start();
 
 let currentJob = '';
 
@@ -38,4 +39,4 @@ async function render() {
 }
 
 C.jobPicker('job-picker', (id) => { currentJob = id; render(); });
-C.poll(render, 2500).start();
+C.configPoll(render, 'scheduler_tick_sec').start();

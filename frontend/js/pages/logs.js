@@ -1,6 +1,7 @@
 /* 日志搜索 Logs */
 Components.init('logs');
 const C = Components;
+RuntimeConfig.start();
 
 let currentJob = '';
 
@@ -42,4 +43,4 @@ function debounce(fn, ms) {
   let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); };
 }
 
-C.poll(render, 3000).start();
+C.configPoll(render, 'scheduler_tick_sec').start();

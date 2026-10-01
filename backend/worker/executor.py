@@ -23,6 +23,7 @@ import os
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 from backend.common import constants as C
@@ -97,9 +98,12 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
     client = HttpClient(timeout=10.0, retries=2)
     sorter = SpillSorter(spill=spill, work_dir=tmp_dir)
 
+    fetch_batch = max(1, int(spec.get("shuffle_fetch_batch", 64)))
+
     fetched = 0
     total_sources = max(1, len(fetch_plan))
-    for idx, src in enumerate(fetch_plan):
+
+    def fetch_one(src: dict) -> list:
         url = (
             f"{src['worker_url']}/shuffle/{job_id}/{src['map_task_id']}/"
             f"{partition_filename(partition)}"
@@ -109,12 +113,17 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
             raise RuntimeError(
                 f"shuffle fetch failed for partition {partition} from {url}"
             )
-        if isinstance(pairs, list):
-            for rec in pairs:
-                if isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                    sorter.add(rec[0], rec[1])
-                    fetched += 1
-        progress_cb(min(1.0, (idx + 1) / total_sources), fetched, 0)
+        return pairs if isinstance(pairs, list) else []
+
+    with ThreadPoolExecutor(max_workers=min(8, fetch_batch)) as pool:
+        for batch_start in range(0, len(fetch_plan), fetch_batch):
+            batch = fetch_plan[batch_start:batch_start + fetch_batch]
+            for pairs in pool.map(fetch_one, batch):
+                for rec in pairs:
+                    if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                        sorter.add(rec[0], rec[1])
+                        fetched += 1
+                progress_cb(min(1.0, (batch_start + len(batch)) / total_sources), fetched, 0)
 
     # Group the externally-sorted stream by key and run the reducer per group.
     results: list[dict] = []
@@ -128,7 +137,7 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
             values = [value]
         else:
             values.append(value)
-    if prev_key is not None and len(results) < 0:
+    if prev_key is not None:
         results.append(reducer(prev_key, values, params))
 
     return {

@@ -12,12 +12,13 @@ from __future__ import annotations
 import csv
 import io
 import os
+import threading
 from typing import Optional
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from backend.common import constants as C
-from backend.common.config import ClusterConfig, ConfigManager, JobDefaults
+from backend.common.config import ClusterConfig, ConfigManager
 from backend.common.logbus import LogBus
 from backend.common.models import Job
 from backend.common.storage import Storage, list_files, read_json
@@ -27,7 +28,7 @@ from backend.master.metrics import Metrics
 from backend.master.registry import WorkerRegistry
 from backend.master.scheduler import Scheduler
 from backend.master.shuffle import ShuffleCoordinator
-from backend.tasks.registry import list_all as list_functions
+from backend.tasks.registry import has_mapper, has_reducer, list_all as list_functions
 from backend.tasks.samples import list_sample_jobs
 
 FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend"))
@@ -43,6 +44,9 @@ class Master:
         self.config_manager = ConfigManager(self.storage)
         self.config_manager.ensure_seeded()
         self.config = (config or self.config_manager.load_cluster()).validated()
+        if config is not None:
+            self.config = self.config_manager.save_cluster(self.config)
+        self._config_lock = threading.RLock()
 
         self.logbus = LogBus(self.storage)
         self.job_manager = JobManager(self.storage, self.config, self.logbus)
@@ -111,6 +115,18 @@ class Master:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _config_snapshot(self) -> ClusterConfig:
+        with self._config_lock:
+            return ClusterConfig(**self.config.to_dict())
+
+    def _update_cluster_config(self, values: dict) -> ClusterConfig:
+        with self._config_lock:
+            validated = self.config_manager.update_cluster(values)
+            for name in ClusterConfig.__dataclass_fields__:
+                setattr(self.config, name, getattr(validated, name))
+        self.scheduler.wake()
+        return validated
+
     def _task_view(self, task) -> dict:
         d = task.to_dict()
         worker = self.registry.get(task.worker_id) if task.worker_id else None
@@ -162,7 +178,7 @@ class Master:
             "jobs_failed": sum(1 for j in jobs if j.status == C.JOB_FAILED),
             "jobs_cancelled": sum(1 for j in jobs if j.status == C.JOB_CANCELLED),
             "workers": self.registry.summary(),
-            "config": self.config.to_dict(),
+            "config": self._config_snapshot().to_dict(),
             "recent_jobs": [self.job_manager.job_summary(j) for j in jobs[:10]],
         })
 
@@ -175,10 +191,24 @@ class Master:
     def _jobs(self):
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
-            body["_defaults"] = self.config_manager.load_defaults().to_dict()
+            defaults = self.config_manager.load_defaults()
+            cfg = self._config_snapshot()
+            body.setdefault("mapper", defaults.mapper)
+            body.setdefault("reducer", defaults.reducer)
+            body.setdefault("num_map_tasks", defaults.num_map_tasks)
+            body.setdefault("num_reduce_tasks", defaults.num_reduce_tasks)
+            body.setdefault("input_rows", defaults.input_rows or cfg.default_input_rows)
+
             try:
+                workers = max(1, len(self.registry.alive()))
+                map_cap = max(1, int(workers * cfg.map_parallelism_factor))
+                reduce_cap = max(1, int(workers * cfg.reduce_parallelism_factor))
+                body["num_map_tasks"] = max(1, min(int(body["num_map_tasks"]), map_cap))
+                body["num_reduce_tasks"] = max(1, min(int(body["num_reduce_tasks"]), reduce_cap))
+                body["_defaults"] = defaults.to_dict()
+                body["_cluster_config"] = cfg.to_dict()
                 job = self.job_manager.submit(body)
-            except (ValueError, KeyError) as exc:
+            except (TypeError, ValueError, KeyError) as exc:
                 return jsonify({"error": str(exc)}), 400
             return jsonify(self.job_manager.job_summary(job)), 201
         return jsonify({"jobs": [self.job_manager.job_summary(j) for j in self.job_manager.list_jobs()]})
@@ -320,21 +350,19 @@ class Master:
     def _config(self):
         if request.method == "PUT":
             body = request.get_json(silent=True) or {}
-            incoming = ClusterConfig.from_dict(body).validated()
-            # Mutate the shared config object in place so the scheduler (which
-            # holds the same reference) sees the new values immediately.
-            for field in ClusterConfig.__dataclass_fields__:
-                if field == "scheduler_tick_sec":
-                    continue
-                setattr(self.config, field, getattr(incoming, field))
-            self.config_manager.save_cluster(self.config)
-            return jsonify(self.config.to_dict())
-        return jsonify(self.config.to_dict())
+            config = self._update_cluster_config(body)
+            return jsonify(config.to_dict())
+        return jsonify(self._config_snapshot().to_dict())
 
     def _config_defaults(self):
         if request.method == "PUT":
             body = request.get_json(silent=True) or {}
-            defaults = self.config_manager.save_defaults(JobDefaults.from_dict(body))
+            candidate = self.config_manager.load_defaults().merge(body).validated()
+            if not has_mapper(candidate.mapper) or not has_reducer(candidate.reducer):
+                return jsonify({"error": "unknown mapper or reducer"}), 400
+            defaults = self.config_manager.update_defaults(body, sync_input_rows=True)
+            if "input_rows" in body:
+                self._update_cluster_config({})
             return jsonify(defaults.to_dict())
         return jsonify(self.config_manager.load_defaults().to_dict())
 

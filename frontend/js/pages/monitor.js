@@ -64,7 +64,8 @@ async function render() {
   ], filtered) : C.empty();
 }
 
+RuntimeConfig.start();
 C.jobPicker('job-picker', (id) => { currentJob = id; render(); });
 document.getElementById('refresh').addEventListener('click', render);
 setupFilters();
-C.poll(render, 2000).start();
+C.configPoll(render, 'scheduler_tick_sec').start();

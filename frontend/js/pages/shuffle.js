@@ -1,6 +1,7 @@
 /* Shuffle 与排序 Shuffle & Sort */
 Components.init('shuffle');
 const C = Components;
+RuntimeConfig.start();
 
 let currentJob = '';
 
@@ -36,4 +37,4 @@ function sourceList(r) {
 }
 
 C.jobPicker('job-picker', (id) => { currentJob = id; render(); });
-C.poll(render, 2000).start();
+C.configPoll(render, 'scheduler_tick_sec').start();
